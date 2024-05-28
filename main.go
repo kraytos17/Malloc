@@ -6,117 +6,105 @@ import (
 )
 
 const (
-	HEAP_CAP_WORDS   = 1024
-	CHUNK_LIST_CAP   = 100
+	HEAP_CAP_BYTES = 640000
+	HEAP_CAP_WORDS = HEAP_CAP_BYTES / int(unsafe.Sizeof(uintptr(0)))
+	CHUNK_LIST_CAP = 1024
+)
+
+var (
+	heap          [HEAP_CAP_WORDS]uintptr
+	stackBase     uintptr
+	reachable     [CHUNK_LIST_CAP]bool
+	toFree        [CHUNK_LIST_CAP]unsafe.Pointer
+	toFreeCount   int
+	allocedChunks = ChunkList{}
+	freedChunks   = ChunkList{
+		count:  1,
+		chunks: []Chunk{{start: uintptr(unsafe.Pointer(&heap[0])), size: uintptr(HEAP_CAP_WORDS)}},
+	}
+	tmpChunks = ChunkList{}
 )
 
 type Chunk struct {
-	start unsafe.Pointer
+	start uintptr
 	size  uintptr
 }
 
 type ChunkList struct {
 	count  int
-	chunks [CHUNK_LIST_CAP]Chunk
+	chunks []Chunk
 }
 
-var (
-	heap           [HEAP_CAP_WORDS]uintptr
-	stackBase      uintptr
-	reachableChunks [CHUNK_LIST_CAP]bool
-	toFree         [CHUNK_LIST_CAP]unsafe.Pointer
-	toFreeCount    int
-
-	allocedChunks = ChunkList{}
-	freedChunks   = ChunkList{
-		count: 1,
-		chunks: [CHUNK_LIST_CAP]Chunk{
-			{start: unsafe.Pointer(&heap[0]), size: HEAP_CAP_WORDS},
-		},
-	}
-	tmpChunks = ChunkList{}
-)
-
-func chunkListInsert(list *ChunkList, start unsafe.Pointer, size uintptr) {
+func (list *ChunkList) insert(start uintptr, size uintptr) {
 	if list.count >= CHUNK_LIST_CAP {
 		panic("Chunk list capacity exceeded")
 	}
 
-	list.chunks[list.count] = Chunk{start: start, size: size}
-
-	for i := list.count; i > 0 && uintptr(list.chunks[i].start) < uintptr(list.chunks[i-1].start); i-- {
-		list.chunks[i], list.chunks[i-1] = list.chunks[i-1], list.chunks[i]
-	}
-
+	newChunk := Chunk{start: start, size: size}
+	list.chunks = append(list.chunks, newChunk)
 	list.count++
 }
 
-func chunkListMerge(dst *ChunkList, src *ChunkList) {
-	dst.count = 0
+func (list *ChunkList) merge(src *ChunkList) {
+	list.chunks = list.chunks[:0]
 
-	for i := 0; i < src.count; i++ {
-		chunk := src.chunks[i]
-
-		if dst.count > 0 {
-			topChunk := &dst.chunks[dst.count-1]
-
-			if uintptr(topChunk.start)+topChunk.size == uintptr(chunk.start) {
+	for _, chunk := range src.chunks {
+		if len(list.chunks) > 0 {
+			topChunk := &list.chunks[len(list.chunks)-1]
+			if topChunk.start+topChunk.size == chunk.start {
 				topChunk.size += chunk.size
 			} else {
-				chunkListInsert(dst, chunk.start, chunk.size)
+				list.insert(chunk.start, chunk.size)
 			}
 		} else {
-			chunkListInsert(dst, chunk.start, chunk.size)
+			list.insert(chunk.start, chunk.size)
 		}
 	}
 }
 
-func chunkListDump(list *ChunkList, name string) {
+func (list *ChunkList) dump(name string) {
 	fmt.Printf("%s Chunks (%d):\n", name, list.count)
-	for i := 0; i < list.count; i++ {
-		fmt.Printf("  start: %p, size: %d\n", list.chunks[i].start, list.chunks[i].size)
+	for _, chunk := range list.chunks {
+		fmt.Printf("  start: %p, size: %d\n", unsafe.Pointer(chunk.start), chunk.size)
 	}
 }
 
-func chunkListFind(list *ChunkList, ptr unsafe.Pointer) int {
-	for i := 0; i < list.count; i++ {
-		if list.chunks[i].start == ptr {
+func (list *ChunkList) find(ptr uintptr) int {
+	for i, chunk := range list.chunks {
+		if chunk.start == ptr {
 			return i
 		}
 	}
-
 	return -1
 }
 
-func chunkListRemove(list *ChunkList, index int) {
-	if index >= list.count {
+func (list *ChunkList) remove(index int) {
+	if index < 0 || index >= list.count {
 		panic("Index out of bounds")
 	}
 
-	for i := index; i < list.count-1; i++ {
-		list.chunks[i] = list.chunks[i+1]
-	}
-
+	copy(list.chunks[index:], list.chunks[index+1:list.count])
 	list.count--
+	list.chunks = list.chunks[:list.count]
 }
 
-func heapAlloc(sizeBytes uintptr) unsafe.Pointer {
+func heapAlloc(sizeBytes uintptr) uintptr {
 	sizeWords := (sizeBytes + unsafe.Sizeof(uintptr(0)) - 1) / unsafe.Sizeof(uintptr(0))
 
 	if sizeWords > 0 {
-		chunkListMerge(&tmpChunks, &freedChunks)
+		tmpChunks.merge(&freedChunks)
 		freedChunks = tmpChunks
 
-		for i := 0; i < freedChunks.count; i++ {
+		for i := 0; i < len(freedChunks.chunks); i++ {
 			chunk := freedChunks.chunks[i]
 			if chunk.size >= sizeWords {
-				chunkListRemove(&freedChunks, i)
+				tmpChunks.remove(i)
 
 				tailSizeWords := chunk.size - sizeWords
-				chunkListInsert(&allocedChunks, chunk.start, sizeWords)
+				allocedChunks.insert(chunk.start, sizeWords)
 
 				if tailSizeWords > 0 {
-					chunkListInsert(&freedChunks, unsafe.Pointer(uintptr(chunk.start)+sizeWords*unsafe.Sizeof(uintptr(0))), tailSizeWords)
+					freedChunks.insert(chunk.start+sizeWords*unsafe.Sizeof(uintptr(0)), tailSizeWords)
 				}
 
 				return chunk.start
@@ -124,29 +112,31 @@ func heapAlloc(sizeBytes uintptr) unsafe.Pointer {
 		}
 	}
 
-	return nil
+	return 0
 }
 
-func heapFree(ptr unsafe.Pointer) {
-	if ptr != nil {
-		index := chunkListFind(&allocedChunks, ptr)
-		if index < 0 {
-			panic("Pointer not found in allocated chunks")
-		}
-		chunkListInsert(&freedChunks, allocedChunks.chunks[index].start, allocedChunks.chunks[index].size)
-		chunkListRemove(&allocedChunks, index)
+func heapFree(ptr uintptr) {
+	if ptr == 0 {
+		return
 	}
+
+	index := allocedChunks.find(ptr)
+	if index < 0 {
+		panic("Pointer not found in allocated chunks")
+	}
+
+	freedChunks.insert(allocedChunks.chunks[index].start, allocedChunks.chunks[index].size)
+	allocedChunks.remove(index)
 }
 
 func markRegion(start, end uintptr) {
 	for ; start < end; start += unsafe.Sizeof(uintptr(0)) {
 		p := *(*uintptr)(unsafe.Pointer(start))
-		for i := 0; i < allocedChunks.count; i++ {
-			chunk := allocedChunks.chunks[i]
-			if uintptr(chunk.start) <= p && p < uintptr(chunk.start)+chunk.size*unsafe.Sizeof(uintptr(0)) {
-				if !reachableChunks[i] {
-					reachableChunks[i] = true
-					markRegion(uintptr(chunk.start), uintptr(chunk.start)+chunk.size*unsafe.Sizeof(uintptr(0)))
+		for i, chunk := range allocedChunks.chunks {
+			if chunk.start <= p && p < chunk.start+chunk.size*unsafe.Sizeof(uintptr(0)) {
+				if !reachable[i] {
+					reachable[i] = true
+					markRegion(chunk.start, chunk.start+chunk.size*unsafe.Sizeof(uintptr(0)))
 				}
 			}
 		}
@@ -155,38 +145,35 @@ func markRegion(start, end uintptr) {
 
 func heapCollect() {
 	stackStart := uintptr(unsafe.Pointer(&stackBase))
-	for i := range reachableChunks {
-		reachableChunks[i] = false
+	for i := range reachable {
+		reachable[i] = false
 	}
 	markRegion(stackStart, stackBase+1)
 
 	toFreeCount = 0
-	for i := 0; i < allocedChunks.count; i++ {
-		if !reachableChunks[i] {
+	for i, chunk := range allocedChunks.chunks {
+		if !reachable[i] {
 			if toFreeCount >= CHUNK_LIST_CAP {
 				panic("To free list capacity exceeded")
 			}
-			toFree[toFreeCount] = allocedChunks.chunks[i].start
+			toFree[toFreeCount] = unsafe.Pointer(chunk.start)
 			toFreeCount++
 		}
 	}
 
 	for i := 0; i < toFreeCount; i++ {
-		heapFree(toFree[i])
+		heapFree(uintptr(toFree[i]))
 	}
 }
 
 func main() {
-	// Initialize stack base for the example.
 	stackBase = uintptr(unsafe.Pointer(&heap))
 
-	// Example usage:
 	ptr := heapAlloc(100)
-	chunkListDump(&allocedChunks, "Allocated")
+	allocedChunks.dump("Allocated")
 	heapFree(ptr)
-	chunkListDump(&freedChunks, "Freed")
+	freedChunks.dump("Freed")
 
-	// Perform garbage collection
 	heapCollect()
-	chunkListDump(&freedChunks, "Freed after GC")
+	freedChunks.dump("Freed after GC")
 }
