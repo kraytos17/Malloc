@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	HEAP_CAP_BYTES = 640000
+	HEAP_CAP_BYTES = 640_000
 	HEAP_CAP_WORDS = HEAP_CAP_BYTES / int(unsafe.Sizeof(uintptr(0)))
 	CHUNK_LIST_CAP = 1024
 )
@@ -17,12 +17,12 @@ var (
 	reachable     [CHUNK_LIST_CAP]bool
 	toFree        [CHUNK_LIST_CAP]unsafe.Pointer
 	toFreeCount   int
-	allocedChunks = ChunkList{}
+	allocedChunks = ChunkList{chunks: make([]Chunk, 0, CHUNK_LIST_CAP)}
 	freedChunks   = ChunkList{
 		count:  1,
 		chunks: []Chunk{{start: uintptr(unsafe.Pointer(&heap[0])), size: uintptr(HEAP_CAP_WORDS)}},
 	}
-	tmpChunks = ChunkList{}
+	tmpChunks = ChunkList{chunks: make([]Chunk, 0, CHUNK_LIST_CAP)}
 )
 
 type Chunk struct {
@@ -41,16 +41,21 @@ func (list *ChunkList) insert(start uintptr, size uintptr) {
 	}
 
 	newChunk := Chunk{start: start, size: size}
-	list.chunks = append(list.chunks, newChunk)
+	if list.count < len(list.chunks) {
+		list.chunks[list.count] = newChunk
+	} else {
+		list.chunks = append(list.chunks, newChunk)
+	}
 	list.count++
 }
 
 func (list *ChunkList) merge(src *ChunkList) {
-	list.chunks = list.chunks[:0]
+	list.count = 0
 
-	for _, chunk := range src.chunks {
-		if len(list.chunks) > 0 {
-			topChunk := &list.chunks[len(list.chunks)-1]
+	for i := 0; i < src.count; i++ {
+		chunk := src.chunks[i]
+		if list.count > 0 {
+			topChunk := &list.chunks[list.count-1]
 			if topChunk.start+topChunk.size == chunk.start {
 				topChunk.size += chunk.size
 			} else {
@@ -64,14 +69,15 @@ func (list *ChunkList) merge(src *ChunkList) {
 
 func (list *ChunkList) dump(name string) {
 	fmt.Printf("%s Chunks (%d):\n", name, list.count)
-	for _, chunk := range list.chunks {
+	for i := 0; i < list.count; i++ {
+		chunk := list.chunks[i]
 		fmt.Printf("  start: %p, size: %d\n", unsafe.Pointer(chunk.start), chunk.size)
 	}
 }
 
 func (list *ChunkList) find(ptr uintptr) int {
-	for i, chunk := range list.chunks {
-		if chunk.start == ptr {
+	for i := 0; i < list.count; i++ {
+		if list.chunks[i].start == ptr {
 			return i
 		}
 	}
@@ -85,7 +91,6 @@ func (list *ChunkList) remove(index int) {
 
 	copy(list.chunks[index:], list.chunks[index+1:list.count])
 	list.count--
-	list.chunks = list.chunks[:list.count]
 }
 
 func heapAlloc(sizeBytes uintptr) uintptr {
@@ -95,10 +100,10 @@ func heapAlloc(sizeBytes uintptr) uintptr {
 		tmpChunks.merge(&freedChunks)
 		freedChunks = tmpChunks
 
-		for i := 0; i < len(freedChunks.chunks); i++ {
+		for i := 0; i < freedChunks.count; i++ {
 			chunk := freedChunks.chunks[i]
 			if chunk.size >= sizeWords {
-				tmpChunks.remove(i)
+				freedChunks.remove(i)
 
 				tailSizeWords := chunk.size - sizeWords
 				allocedChunks.insert(chunk.start, sizeWords)
@@ -111,7 +116,6 @@ func heapAlloc(sizeBytes uintptr) uintptr {
 			}
 		}
 	}
-
 	return 0
 }
 
@@ -132,7 +136,8 @@ func heapFree(ptr uintptr) {
 func markRegion(start, end uintptr) {
 	for ; start < end; start += unsafe.Sizeof(uintptr(0)) {
 		p := *(*uintptr)(unsafe.Pointer(start))
-		for i, chunk := range allocedChunks.chunks {
+		for i := 0; i < allocedChunks.count; i++ {
+			chunk := allocedChunks.chunks[i]
 			if chunk.start <= p && p < chunk.start+chunk.size*unsafe.Sizeof(uintptr(0)) {
 				if !reachable[i] {
 					reachable[i] = true
@@ -151,12 +156,12 @@ func heapCollect() {
 	markRegion(stackStart, stackBase+1)
 
 	toFreeCount = 0
-	for i, chunk := range allocedChunks.chunks {
+	for i := 0; i < allocedChunks.count; i++ {
 		if !reachable[i] {
 			if toFreeCount >= CHUNK_LIST_CAP {
 				panic("To free list capacity exceeded")
 			}
-			toFree[toFreeCount] = unsafe.Pointer(chunk.start)
+			toFree[toFreeCount] = unsafe.Pointer(allocedChunks.chunks[i].start)
 			toFreeCount++
 		}
 	}
@@ -169,7 +174,7 @@ func heapCollect() {
 func main() {
 	stackBase = uintptr(unsafe.Pointer(&heap))
 
-	ptr := heapAlloc(100)
+	ptr := heapAlloc(123)
 	allocedChunks.dump("Allocated")
 	heapFree(ptr)
 	freedChunks.dump("Freed")
