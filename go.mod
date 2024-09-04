@@ -1,3 +1,3 @@
-module github.com/soumil-kumar17/Malloc
+module github.com/kraytos17/Malloc
 
-go 1.22.3
+go 1.23.0
